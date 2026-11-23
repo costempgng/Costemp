@@ -51,7 +51,13 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Run unit tests
-        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest
+        # Android variants plus the pure-Kotlin geometry/measurement/project modules.
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            testDebugUnitTest \
+            :core:geometry:test \
+            :core:measurement:test \
+            :core:project:test
 
       - name: Assemble debug APK
         run: ./gradlew --no-daemon --stacktrace assembleDebug
