@@ -1,0 +1,145 @@
+name: release
+
+# Builds signed release artifacts and publishes a GitHub Release.
+# Trigger by pushing a version tag (e.g. v0.1.0) or run manually with a version.
+#
+# Required repository secrets for signing (Settings → Secrets and variables → Actions):
+#   RELEASE_KEYSTORE_BASE64    base64 of your .jks:  base64 -w0 release.jks
+#   RELEASE_KEYSTORE_PASSWORD  keystore password
+#   RELEASE_KEY_ALIAS          key alias
+#   RELEASE_KEY_PASSWORD       key password
+# Without them the workflow still builds, but the APK/AAB stay unsigned.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (without leading v), e.g. 0.1.0'
+        required: true
+        type: string
+      prerelease:
+        description: 'Publish as a pre-release'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Exposed so the signing step can decide whether secrets are configured.
+      RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+      RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+      RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Android project is present
+        run: |
+          if [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+            echo "::error::No Gradle project found. Costemp is still at the documentation stage."
+            echo "::error::Add the Phase 1 Android scaffold before releasing."
+            exit 1
+          fi
+          if [ ! -f gradlew ]; then
+            echo "::error::Gradle wrapper (gradlew) is missing. Generate it with 'gradle wrapper --gradle-version 8.7' and commit it."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Resolve release version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid release version '$VERSION' (expected e.g. 0.1.0)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing Costemp $VERSION"
+
+      - name: Provide signing key
+        if: ${{ env.RELEASE_KEYSTORE_BASE64 != '' }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+          {
+            echo "KEYSTORE_FILE=$KEYSTORE"
+            echo "KEYSTORE_PASSWORD=$RELEASE_KEYSTORE_PASSWORD"
+            echo "KEY_ALIAS=$RELEASE_KEY_ALIAS"
+            echo "KEY_PASSWORD=$RELEASE_KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "Signing keystore ready."
+
+      - name: Build release artifacts
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            -PversionName="${{ steps.version.outputs.version }}" \
+            assembleRelease bundleRelease
+
+      - name: Collect artifacts and checksums
+        run: |
+          mkdir -p dist
+          find app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) -exec cp {} dist/ \;
+          if [ -z "$(ls -A dist)" ]; then
+            echo "::error::No APK/AAB produced by assembleRelease/bundleRelease."
+            exit 1
+          fi
+          ( cd dist && sha256sum ./* > SHA256SUMS.txt )
+          ls -lh dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: costemp-release-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          NOTES=$(printf '%s\n\n%s' \
+            "Costemp ${{ steps.version.outputs.version }} — open-source Android cosplay modeling, retopology, armor measurement and papercraft studio." \
+            "Artifacts: release APK and AAB, with SHA-256 checksums.")
+          if [ -z "${KEYSTORE_FILE:-}" ]; then
+            NOTES=$(printf '%s\n\n%s' "$NOTES" "Note: these builds are unsigned (release signing secrets are not configured).")
+          fi
+          FLAGS=(--title "Costemp ${{ steps.version.outputs.version }}" --notes "$NOTES" --generate-notes)
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            FLAGS+=(--prerelease)
+          fi
+          gh release create "$TAG" dist/* "${FLAGS[@]}"

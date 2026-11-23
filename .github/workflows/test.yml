@@ -1,0 +1,76 @@
+name: test
+
+# Builds Costemp debug artifacts and runs the geometry/measurement unit tests.
+# Triggered on every push, pull request and manually from the Actions tab.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-artifacts:
+    name: Build artifacts (debug APK + unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Android project is present
+        run: |
+          if [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+            echo "::error::No Gradle project found. Costemp is still at the documentation stage."
+            echo "::error::Add the Phase 1 Android scaffold (settings.gradle.kts, app/build.gradle.kts, gradle/wrapper) before this workflow can build."
+            exit 1
+          fi
+          if [ ! -f gradlew ]; then
+            echo "::error::Gradle wrapper (gradlew) is missing. Generate it with 'gradle wrapper --gradle-version 8.7' and commit it."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Run unit tests
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest
+
+      - name: Assemble debug APK
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: costemp-unit-test-reports
+          path: |
+            **/build/reports/tests/**
+            **/build/test-results/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: costemp-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
